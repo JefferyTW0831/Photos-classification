@@ -12,25 +12,13 @@ import os
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
 ROOT_FOLDER_NAME = "元修檔案"
 PHOTOS_FOLDER_NAME = "照片"
-MONTH_NAMES = [
-    "一月",
-    "二月",
-    "三月",
-    "四月",
-    "五月",
-    "六月",
-    "七月",
-    "八月",
-    "九月",
-    "十月",
-    "十一月",
-    "十二月",
-]
+LOG_FILE_NAME = "photo_sorter.log"
 
 # Pattern a: 20241019_111535，可接受額外尾碼
 PATTERN_DATE_TIME = re.compile(r"^(?P<date>\d{8})_\d{4,6}.*$")
@@ -47,13 +35,57 @@ PATTERN_VIDEO_CAPTURE = re.compile(
     flags=re.IGNORECASE,
 )
 
-DATE_FOLDER_PATTERN = re.compile(r"^(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})$")
+class Logger:
+    """同時輸出到終端和日誌文件的記錄器"""
+
+    def __init__(self, log_file_path: Path):
+        self.log_file_path = log_file_path
+        self.log_file = None
+
+    def __enter__(self):
+        """開啟日誌文件（追加模式）"""
+        self.log_file = open(self.log_file_path, "a", encoding="utf-8")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.log_file.write(f"\n{'='*60}\n")
+        self.log_file.write(f"執行時間：{timestamp}\n")
+        self.log_file.write(f"{'='*60}\n")
+        self.log_file.flush()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """關閉日誌文件"""
+        if self.log_file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.log_file.write(f"結束時間：{timestamp}\n")
+            self.log_file.write(f"{'='*60}\n\n")
+            self.log_file.close()
+
+    def log(self, message: str) -> None:
+        """同時輸出到終端和日誌文件"""
+        # 輸出到終端
+        print(message)
+        # 輸出到日誌文件（帶時間戳）
+        if self.log_file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.log_file.write(f"[{timestamp}] {message}\n")
+            self.log_file.flush()
 
 
-def iter_candidate_files(root: Path) -> Iterator[Path]:
-    """Yield files (not directories) under ``root`` recursively."""
+def iter_candidate_files(root: Path, exclude_path: Path | None = None) -> Iterator[Path]:
+    """Yield files (not directories) under ``root`` recursively, excluding subdirectories of exclude_path."""
     for path in root.rglob("*"):
         if path.is_file():
+            # 如果指定了排除路徑，且文件在排除路徑的子目錄中（不包括排除路徑本身），則跳過
+            if exclude_path:
+                try:
+                    path_resolved = path.resolve()
+                    exclude_resolved = exclude_path.resolve()
+                    # 如果文件的父目錄是排除路徑的子目錄（不包括排除路徑本身），則跳過
+                    # 這樣可以掃描排除路徑本身，但不掃描其子目錄
+                    if path_resolved.parent != exclude_resolved and exclude_resolved in path_resolved.parents:
+                        continue
+                except (FileNotFoundError, ValueError):
+                    pass
             yield path
 
 
@@ -85,7 +117,8 @@ def move_file(src: Path, dest_dir: Path) -> None:
 
 def classify_photos(search_root: Path, destination_root: Path) -> tuple[int, int]:
     moved = skipped = 0
-    for file_path in iter_candidate_files(search_root):
+    
+    for file_path in iter_candidate_files(search_root, exclude_path=destination_root):
         date_str = extract_date_from_name(file_path.name)
         if not date_str:
             skipped += 1
@@ -107,42 +140,6 @@ def classify_photos(search_root: Path, destination_root: Path) -> tuple[int, int
     return moved, skipped
 
 
-def move_date_folder_to_month(folder: Path, month_root: Path, month_name: str) -> None:
-    month_dir = month_root / month_name
-    month_dir.mkdir(parents=True, exist_ok=True)
-    destination = month_dir / folder.name
-    if destination.exists():
-        duplicate = 1
-        while True:
-            candidate = month_dir / f"{folder.name}_{duplicate}"
-            if not candidate.exists():
-                destination = candidate
-                break
-            duplicate += 1
-    shutil.move(str(folder), destination)
-
-
-def group_date_folders_by_month(photos_root: Path) -> int:
-    moved = 0
-    entries = list(photos_root.iterdir())
-    for entry in entries:
-        if not entry.is_dir():
-            continue
-        match = DATE_FOLDER_PATTERN.match(entry.name)
-        if not match:
-            continue
-        year = match.group("year")
-        month_index = int(match.group("month")) - 1
-        if month_index < 0 or month_index >= len(MONTH_NAMES):
-            continue
-        month_dir_name = f"{year}_{MONTH_NAMES[month_index]}"
-        if entry.parent.name == month_dir_name:
-            continue
-        move_date_folder_to_month(entry, photos_root, month_dir_name)
-        moved += 1
-    return moved
-
-
 def resolve_app_dir() -> Path:
     """Return the folder where this script/executable resides."""
     if getattr(sys, "frozen", False):
@@ -153,20 +150,24 @@ def resolve_app_dir() -> Path:
 def main() -> None:
     app_dir = resolve_app_dir()
     os.chdir(app_dir)
-    print(f"目前工作目錄：{app_dir}")
-    root_folder = app_dir / ROOT_FOLDER_NAME
-    photos_folder = root_folder / PHOTOS_FOLDER_NAME
+    log_file_path = app_dir / LOG_FILE_NAME
 
-    if not root_folder.exists():
-        raise RuntimeError(f"找不到資料夾：{root_folder}")
+    # 使用Logger來記錄所有輸出
+    with Logger(log_file_path) as logger:
+        logger.log(f"目前工作目錄：{app_dir}")
+        root_folder = app_dir / ROOT_FOLDER_NAME
+        photos_folder = root_folder / PHOTOS_FOLDER_NAME
 
-    photos_folder.mkdir(parents=True, exist_ok=True)
+        if not root_folder.exists():
+            error_msg = f"找不到資料夾：{root_folder}"
+            logger.log(f"錯誤：{error_msg}")
+            raise RuntimeError(error_msg)
 
-    moved, skipped = classify_photos(app_dir, photos_folder)
-    month_moves = group_date_folders_by_month(photos_folder)
-    print(f"搬移完成：{moved} 檔案")
-    print(f"忽略：{skipped} 檔案（不符合命名或已在目的地）")
-    print(f"月份分類：{month_moves} 個日期資料夾")
+        photos_folder.mkdir(parents=True, exist_ok=True)
+
+        moved, skipped = classify_photos(app_dir, photos_folder)
+        logger.log(f"搬移完成：{moved} 檔案")
+        logger.log(f"忽略：{skipped} 檔案（不符合命名或已在目的地）")
 
 
 if __name__ == "__main__":
